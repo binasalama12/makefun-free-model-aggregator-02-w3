@@ -52,7 +52,10 @@ A gateway refusal (429, 5xx, or a network failure) is never the final word
 while another capable model remains: the router walks down the tier order —
 dropping to the next band when a band is exhausted — for up to eight
 attempts per prompt. Each refused model is put to rest for a few following
-requests (longest after a 429) and is skipped while it rests; if every
+requests (longest after a 429) and is skipped while it rests. The rest grows
+with the model's consecutive-refusal streak — a 429 rests it for 3 requests,
+a second straight refusal for 6, capped at 8 — and one success clears the
+streak, so a model that recovers is welcomed back at the base rest. If every
 capable model happens to be resting, the one that wakes soonest is tried
 first rather than giving up. When a retry succeeds, the refusals it took
 are reported on the final response in the `x-makefun-upstream-failures`

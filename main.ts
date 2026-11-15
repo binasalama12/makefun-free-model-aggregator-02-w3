@@ -18,6 +18,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
+  bandOf,
   catalogFromPool,
   dialOrder,
   isDict,
@@ -59,6 +60,7 @@ function note(msg: string): void {
 
 let requestSeq = 0;
 const restUntil = new Map<string, number>();
+const failStreak = new Map<string, number>();
 const laneSpin = new Map<number, number>();
 const failuresOfThisPrompt: Array<{ status: number; code: string; model: string | null }> = [];
 
@@ -66,21 +68,27 @@ function isResting(modelId: string, seq: number): boolean {
   return (restUntil.get(modelId) ?? -1) > seq;
 }
 
-/** Lama istirahat (dalam satuan request) sesudah satu penolakan, versi dasar. */
-function restLength(status: number): number {
+/** Lama istirahat dasar (dalam satuan request) untuk satu jenis penolakan. */
+function restBase(status: number): number {
   if (status === 429) return 3; // limit: istirahat paling lama
   if (status === 0) return 2; // jaringan putus
   if (status >= 500) return 2;
   return 1;
 }
 
-function putToRest(modelId: string, status: number, seq: number): void {
-  restUntil.set(modelId, seq + restLength(status) + 1);
-  failuresOfThisPrompt.push({
-    status,
-    code: 'upstream_refused',
-    model: modelId,
-  });
+/**
+ * Catat satu penolakan: model diistirahatkan dan jejaknya disimpan untuk
+ * header failover. Istirahat MENGGANDA dengan streak kegagalan beruntun
+ * model itu (429: 3, 6, lalu mentok 8 request) — model yang berulang kali
+ * menolak terbukti sedang bermasalah, jadi jangan cepat-cepat didial lagi;
+ * satu keberhasilan mereset streak-nya ke nol (lihat dialWithFailover).
+ */
+function noteRefusal(modelId: string, status: number, code: string, seq: number): void {
+  const streak = (failStreak.get(modelId) ?? 0) + 1;
+  failStreak.set(modelId, streak);
+  const rest = Math.min(restBase(status) * streak, 8);
+  restUntil.set(modelId, seq + rest + 1);
+  failuresOfThisPrompt.push({ status, code, model: modelId });
 }
 
 function failuresHeader(): Record<string, string> {
@@ -169,7 +177,7 @@ async function dialWithFailover(
 ): Promise<DialOutcome> {
   const ranked = dialOrder(pool, need, laneSpin);
   // Majukan putaran round-robin tiap gelang sekali untuk request ini.
-  const bandsSeen = new Set(ranked.map((m) => (m.ratingMilli >= 1300 ? 0 : m.ratingMilli >= 1200 ? 1 : 2)));
+  const bandsSeen = new Set(ranked.map((m) => bandOf(m.ratingMilli)));
   for (const b of bandsSeen) laneSpin.set(b, (laneSpin.get(b) ?? 0) + 1);
 
   const awake = ranked.filter((m) => !isResting(m.dialId, seq));
@@ -198,19 +206,18 @@ async function dialWithFailover(
       });
     } catch {
       // Jaringan/timeout: catat sebagai status 0 dan lanjut ke model berikut.
-      restUntil.set(candidate.dialId, seq + restLength(0) + 1);
-      failuresOfThisPrompt.push({ status: 0, code: 'network_error', model: candidate.dialId });
+      noteRefusal(candidate.dialId, 0, 'network_error', seq);
       last = { ok: false, modelId: candidate.dialId, response: null };
       continue;
     }
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
-      restUntil.set(candidate.dialId, seq + restLength(resp.status) + 1);
-      failuresOfThisPrompt.push({ status: resp.status, code: codeFromErrorText(text, resp.status), model: candidate.dialId });
+      noteRefusal(candidate.dialId, resp.status, codeFromErrorText(text, resp.status), seq);
       last = { ok: false, modelId: candidate.dialId, response: null };
       continue;
     }
     restUntil.delete(candidate.dialId); // sukses: model segar lagi
+    failStreak.delete(candidate.dialId); // ...dan streak kegagalannya hangus
     return { ok: true, modelId: candidate.dialId, response: resp };
   }
   return last;
